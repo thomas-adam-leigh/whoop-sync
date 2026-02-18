@@ -1,7 +1,7 @@
 import { config } from "./config";
 import { getToken, login, clearToken } from "./auth";
 import { fetchHeartRate, AuthExpiredError } from "./api";
-import { initDb, getHighWaterMark, insertHeartRatePoints, close } from "./db";
+import { getHighWaterMark, insertHeartRatePoints } from "./db";
 
 async function sync(): Promise<void> {
   // 1. Ensure we have a valid token
@@ -51,8 +51,6 @@ async function main(): Promise<void> {
     `[main] Whoop Sync starting (interval: ${config.syncIntervalMinutes}m)`
   );
 
-  await initDb();
-
   // Run immediately on startup
   await runSync();
 
@@ -70,15 +68,13 @@ async function runSync(): Promise<void> {
 }
 
 // Graceful shutdown
-process.on("SIGINT", async () => {
+process.on("SIGINT", () => {
   console.log("[main] Shutting down...");
-  await close();
   process.exit(0);
 });
 
-process.on("SIGTERM", async () => {
+process.on("SIGTERM", () => {
   console.log("[main] Shutting down...");
-  await close();
   process.exit(0);
 });
 

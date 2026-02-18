@@ -1,29 +1,12 @@
-import { Pool } from "pg";
+import { createClient } from "@supabase/supabase-js";
 import { config } from "./config";
 
-const pool = new Pool(config.db);
-
-export async function initDb(): Promise<void> {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS heart_rate (
-      time       TIMESTAMPTZ NOT NULL,
-      bpm        INTEGER NOT NULL,
-      user_id    INTEGER NOT NULL,
-      synced_at  TIMESTAMPTZ DEFAULT NOW(),
-      PRIMARY KEY (user_id, time)
-    );
-  `);
-  await pool.query(`
-    CREATE INDEX IF NOT EXISTS idx_heart_rate_time ON heart_rate (time DESC);
-  `);
-  console.log("[db] Schema initialized");
-}
+const supabase = createClient(config.supabaseUrl, config.supabaseAnonKey);
 
 export async function getHighWaterMark(): Promise<Date | null> {
-  const result = await pool.query<{ max: Date | null }>(
-    "SELECT MAX(time) as max FROM heart_rate"
-  );
-  return result.rows[0]?.max || null;
+  const { data, error } = await supabase.rpc("get_heart_rate_watermark");
+  if (error) throw new Error(`Failed to get watermark: ${error.message}`);
+  return data ? new Date(data) : null;
 }
 
 export async function insertHeartRatePoints(
@@ -32,26 +15,16 @@ export async function insertHeartRatePoints(
 ): Promise<number> {
   if (points.length === 0) return 0;
 
-  // Build a single INSERT with multiple VALUES rows
-  const values: any[] = [];
-  const placeholders: string[] = [];
+  const payload = points.map((p) => ({
+    time: p.time,
+    bpm: p.bpm,
+    user_id: userId,
+  }));
 
-  for (let i = 0; i < points.length; i++) {
-    const offset = i * 3;
-    placeholders.push(`($${offset + 1}, $${offset + 2}, $${offset + 3})`);
-    values.push(new Date(points[i].time), points[i].bpm, userId);
-  }
+  const { data, error } = await supabase.rpc("insert_heart_rate", {
+    points: payload,
+  });
 
-  const result = await pool.query(
-    `INSERT INTO heart_rate (time, bpm, user_id)
-     VALUES ${placeholders.join(", ")}
-     ON CONFLICT (user_id, time) DO NOTHING`,
-    values
-  );
-
-  return result.rowCount ?? 0;
-}
-
-export async function close(): Promise<void> {
-  await pool.end();
+  if (error) throw new Error(`Failed to insert heart rate: ${error.message}`);
+  return data ?? 0;
 }
