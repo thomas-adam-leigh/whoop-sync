@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Dockerized service that runs on a Linux server and continuously syncs heart rate data from the Whoop dashboard into a local PostgreSQL database. Whoop does not expose live heart rate via their public API, but the internal dashboard at `https://app.whoop.com` fetches it from an internal API. This service automates that process.
+A Dockerized service that runs on a Linux server and continuously syncs heart rate data from the Whoop dashboard into a Supabase PostgreSQL database. Whoop does not expose live heart rate via their public API, but the internal dashboard at `https://app.whoop.com` fetches it from an internal API. This service automates that process.
 
 ## How It Works (Research Findings)
 
@@ -16,6 +16,8 @@ Whoop uses **AWS Cognito** for authentication. The Cognito client has a server-s
 3. Click the `Sign In` button
 4. Page redirects to `https://app.whoop.com/athlete/{userId}/1d/today`
 5. Auth tokens are now stored in browser cookies
+
+**Cloudflare Turnstile:** The login page uses Cloudflare Turnstile anti-bot protection. To bypass it, Playwright must launch with `--disable-blink-features=AutomationControlled`, set a realistic user agent, and hide the `navigator.webdriver` flag via `addInitScript`.
 
 **Token details:**
 - Cookie name: `whoop-auth-token` - a JWT Bearer token
@@ -90,22 +92,19 @@ Same Bearer token auth. This is a secondary goal - heart rate sync is the primar
 
 ## Environment Variables
 
-The `.env` file in the project root contains:
+The `.env` file in the project root must contain:
 
 ```
 LOGIN_EMAIL=<whoop account email>
 LOGIN_PASSWORD=<whoop account password>
+SUPABASE_URL=<supabase project URL, e.g. https://xxx.supabase.co>
+SUPABASE_ANON_KEY=<supabase anon/public key>
 ```
 
-The implementation should also support these variables (with sensible defaults):
+Optional (with defaults):
 
 ```
 SYNC_INTERVAL_MINUTES=5
-DB_HOST=localhost
-DB_PORT=5432
-DB_NAME=whoop
-DB_USER=whoop
-DB_PASSWORD=whoop
 ```
 
 ## Architecture
@@ -126,31 +125,37 @@ Every 5 minutes:
      with Authorization: Bearer {token}
   4. If response.values is empty: done (no new data yet, this is normal)
   5. If response.values has data:
-     - INSERT INTO heart_rate (time, bpm, user_id) VALUES (...)
-       ON CONFLICT (time, user_id) DO NOTHING
-     - Set high-water mark = max(time) from the returned values
+     - Call insert_heart_rate RPC with the batch of points
+     - The RPC handles ON CONFLICT (user_id, time) DO NOTHING internally
+     - High-water mark advances to max(time) from returned values
 ```
 
 **Why 5 minutes:** Heart rate data appears in the API with ~10 minutes of latency, arriving in batches. A 5-minute interval means each request will typically return 5-10 new data points. This matches the data availability well without wasted requests.
 
-**The `ON CONFLICT DO NOTHING` is a safety net**, not the primary dedup mechanism. It protects against edge cases like process restarts where the watermark might not have been persisted. Under normal operation, the watermark ensures you never request data you already have.
+**The `ON CONFLICT DO NOTHING` inside the RPC is a safety net**, not the primary dedup mechanism. It protects against edge cases like process restarts where the watermark might not have been persisted. Under normal operation, the watermark ensures you never request data you already have.
 
-**High-water mark storage:** On startup, query `SELECT MAX(time) FROM heart_rate` to recover the watermark. No separate state file needed - the database is the source of truth. During runtime, keep it in memory and update after each successful insert batch.
+**High-water mark storage:** Retrieved via the `get_heart_rate_watermark` RPC function which runs `SELECT MAX(time) FROM whoop.heart_rate`. No separate state file needed - the database is the source of truth.
 
 ### Token Management
 
 - After Playwright login, extract all three cookies: `whoop-auth-token`, `whoop-auth-refresh-token`, `whoop-auth-expiry`
 - Parse the JWT to extract `custom:user_id` (so the user ID doesn't need to be hardcoded)
 - Parse `exp` from the JWT to know when it expires
-- Store the token in memory or on disk (a simple JSON file is fine)
+- Store the token in memory (token is refreshed by re-login when expired)
 - Re-login via Playwright when the token is expired or an API call returns 401
 
-### Database
+### Database (Supabase)
 
-**PostgreSQL** running locally (or in a sibling Docker container).
+Data is stored in a **Supabase** PostgreSQL instance in the `whoop` schema. The service communicates with Supabase via `@supabase/supabase-js` calling RPC functions, so the `whoop` schema does **not** need to be exposed in Supabase's API settings.
+
+**Schema setup (run once in Supabase SQL Editor):**
 
 ```sql
-CREATE TABLE IF NOT EXISTS heart_rate (
+-- Create the whoop schema
+CREATE SCHEMA IF NOT EXISTS whoop;
+
+-- Create the heart_rate table
+CREATE TABLE whoop.heart_rate (
     time       TIMESTAMPTZ NOT NULL,
     bpm        INTEGER NOT NULL,
     user_id    INTEGER NOT NULL,
@@ -158,17 +163,58 @@ CREATE TABLE IF NOT EXISTS heart_rate (
     PRIMARY KEY (user_id, time)
 );
 
-CREATE INDEX IF NOT EXISTS idx_heart_rate_time ON heart_rate (time DESC);
+CREATE INDEX idx_heart_rate_time ON whoop.heart_rate (time DESC);
+
+-- Permissions
+GRANT USAGE ON SCHEMA whoop TO anon, authenticated;
+GRANT ALL ON ALL TABLES IN SCHEMA whoop TO anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA whoop GRANT ALL ON TABLES TO anon, authenticated;
 ```
 
-The composite primary key `(user_id, time)` ensures idempotent inserts via `ON CONFLICT DO NOTHING`.
+**RPC functions (run once in Supabase SQL Editor):**
+
+```sql
+-- Batch insert heart rate data with deduplication
+CREATE OR REPLACE FUNCTION insert_heart_rate(points JSONB)
+RETURNS INTEGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  inserted INTEGER;
+BEGIN
+  WITH ins AS (
+    INSERT INTO whoop.heart_rate (time, bpm, user_id)
+    SELECT
+      to_timestamp((p->>'time')::bigint / 1000.0) AT TIME ZONE 'UTC',
+      (p->>'bpm')::integer,
+      (p->>'user_id')::integer
+    FROM jsonb_array_elements(points) AS p
+    ON CONFLICT (user_id, time) DO NOTHING
+    RETURNING 1
+  )
+  SELECT COUNT(*) INTO inserted FROM ins;
+  RETURN inserted;
+END;
+$$;
+
+-- Get the most recent synced timestamp
+CREATE OR REPLACE FUNCTION get_heart_rate_watermark()
+RETURNS TIMESTAMPTZ
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+  SELECT MAX(time) FROM whoop.heart_rate;
+$$;
+```
 
 ### Docker
 
-The project should produce a `docker-compose.yml` with two services:
+The project produces a `docker-compose.yml` with a single service:
 
-1. **postgres** - standard postgres image, with a volume for persistence
-2. **whoop-sync** - the Node.js application with Playwright
+1. **whoop-sync** - the Node.js application with Playwright
+
+No database container is needed since Supabase is used as the remote database.
 
 The sync service Dockerfile needs:
 - Node.js runtime
@@ -177,28 +223,30 @@ The sync service Dockerfile needs:
 
 ## Tech Stack
 
-- **Runtime**: Node.js (TypeScript preferred)
+- **Runtime**: Node.js (TypeScript)
 - **Browser automation**: Playwright (headless Chromium)
-- **Scheduling**: node-cron or a simple setInterval loop
-- **Database client**: pg (node-postgres)
+- **Scheduling**: setInterval loop
+- **Database**: Supabase (@supabase/supabase-js)
 - **Environment**: dotenv
 
 ## Important Implementation Notes
 
 1. **Playwright on Linux needs system dependencies.** The Dockerfile must install them. The `npx playwright install --with-deps chromium` command handles this on Debian/Ubuntu-based images.
 
-2. **The login page structure**: The sign-in page has a text input with label "Email", a text input with label "Password", and a button with text "Sign In". After successful login, the URL changes to `https://app.whoop.com/athlete/{userId}/...`.
+2. **The login page structure**: The sign-in page has input fields identifiable by placeholder text "Email address" and "Password", and a button matching `/sign in/i`. After successful login, the URL changes to `https://app.whoop.com/athlete/{userId}/...`.
 
-3. **Cookie extraction after login**: After the page navigates post-login, read all cookies from the browser context. The three relevant cookies are on the `.whoop.com` domain: `whoop-auth-token`, `whoop-auth-refresh-token`, `whoop-auth-expiry`.
+3. **Cloudflare Turnstile bypass**: The login page has anti-bot protection. Playwright must be configured with `--disable-blink-features=AutomationControlled`, a realistic user agent string, and `navigator.webdriver` set to `false` via `addInitScript`.
 
-4. **The `step` parameter**: Use `step=60` for 1-minute resolution. The API also accepts `step=600` for 10-minute resolution. Stick with 60.
+4. **Cookie extraction after login**: After the page navigates post-login, read all cookies from the browser context. The three relevant cookies are on the `.whoop.com` domain: `whoop-auth-token`, `whoop-auth-refresh-token`, `whoop-auth-expiry`.
 
-5. **Time zones**: All API timestamps are in UTC (epoch milliseconds). Store as `TIMESTAMPTZ` in PostgreSQL.
+5. **The `step` parameter**: Use `step=60` for 1-minute resolution. The API also accepts `step=600` for 10-minute resolution. Stick with 60.
 
-6. **The metrics endpoint only supports `heart_rate`**. Attempting other metric names (skin_temp, spo2, hrv, etc.) returns HTTP 400 with `"query param name must be one of [heart_rate]"`.
+6. **Time zones**: All API timestamps are in UTC (epoch milliseconds). Store as `TIMESTAMPTZ` in PostgreSQL.
 
-7. **Graceful handling of empty responses**: If the Whoop is not being worn or has no data for a time window, the API returns `{"name":"heart_rate","start":...,"values":[]}`. This is normal, not an error.
+7. **The metrics endpoint only supports `heart_rate`**. Attempting other metric names (skin_temp, spo2, hrv, etc.) returns HTTP 400 with `"query param name must be one of [heart_rate]"`.
 
-8. **Rate limiting**: No rate limiting was observed during testing. A 5-minute polling interval with a single GET request per cycle is very light.
+8. **Graceful handling of empty responses**: If the Whoop is not being worn or has no data for a time window, the API returns `{"name":"heart_rate","start":...,"values":[]}`. This is normal, not an error.
 
-9. **401 handling**: If an API call returns "Authorization was not valid", the token has expired. Trigger a fresh Playwright login.
+9. **Rate limiting**: No rate limiting was observed during testing. A 5-minute polling interval with a single GET request per cycle is very light.
+
+10. **401 handling**: If an API call returns "Authorization was not valid", the token has expired. Trigger a fresh Playwright login.
